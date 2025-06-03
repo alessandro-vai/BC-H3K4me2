@@ -1,0 +1,220 @@
+---
+title: "Supp Fig 3"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(circlize))
+library(limma)
+library(SummarizedExperiment)
+```
+
+
+```{r SE object}
+ratios <- readxl::read_xlsx("Supplementary Dataset 2.xlsx",
+                            sheet = "Cohort 2",
+                            skip = 4, col_names = F) |> 
+    column_to_rownames("...1")
+
+info <- readxl::read_xlsx("Supplementary Dataset 2.xlsx",
+                        sheet = "Cohort 2",
+                        n_max = 3, col_names = F) |> 
+    t()
+colnames(info) <- c("Sample ID", "Subtype", "Storage")
+info <- info[-1,]
+clinical <- readxl::read_xlsx("Supplementary Dataset 1.xlsx",
+                               col_types = c("guess", "guess",
+                                             "guess", "guess",
+                                             "date", "guess",
+                                             "guess", "date",
+                                             "date", rep("guess", 8))) |> 
+    filter(Cohort == "Cohort 2") |> 
+    select(-Subtype, -Storage)
+
+clinical <- left_join(as_tibble(info), clinical) |> 
+    distinct(`Sample ID`, .keep_all = T) |> 
+    mutate(Subtype = case_when(Subtype == "TN" & Relapse == "no" ~ "TNnoRel",
+                               Subtype == "TN" & Relapse == "yes" ~ "TNRel",
+                               TRUE ~ "LuA"))
+
+se <- SummarizedExperiment(assays = ratios,
+                           colData = clinical)
+```
+
+```{r Outliers}
+outliers <- inner_join(colData(se) |>
+                           as.data.frame() |>
+                           as_tibble(rownames="Sample") |>
+                           select(Sample, Subtype),
+                       assay(se) |> t() |> as_tibble(rownames="Sample")) |> 
+    pivot_longer(!c(Sample, Subtype), names_to = "PTM", values_to = "log2ratio") |> 
+    rstatix::group_by(PTM) |> rstatix::identify_outliers(variable = "log2ratio") |> 
+    filter(is.outlier) |> select(PTM, Sample) |> as.data.frame()
+no_outliers <- assay(se)
+for (i in 1:nrow(outliers)) {
+    ptm <- outliers[i, "PTM"]
+    Sample <- outliers[i, "Sample"]
+    no_outliers[ptm, Sample] <- NA
+}
+rm(ptm, Sample)
+assay(se) <- no_outliers
+```
+
+```{r Test}
+design <- model.matrix(~0+se$Subtype)
+colnames(design) <- gsub("se\\$Subtype", "", colnames(design))
+contr.matrix <- makeContrasts(TNnoRelvsLuA = TNnoRel - LuA,
+                              TNRelvsLuA = TNRel - LuA,
+                              TNRelvsTNnoRel = TNRel - TNnoRel,
+                              TNvsLuA = (TNRel + TNnoRel / 2) - LuA,
+                              levels = colnames(design))
+efit <- lmFit(assay(se), design) |>
+        contrasts.fit(contrasts=contr.matrix) |>
+        eBayes(robust = T)
+tt_df <- lapply(colnames(contr.matrix),
+       \(x) topTable(efit,
+               sort.by = "P",
+               n = Inf,
+               adjust.method = "none",
+               coef = x) |> 
+         as_tibble(rownames = "PTMs") |> 
+         mutate(Comparison = x)) |> 
+  purrr::reduce(bind_rows)
+TNvsLuA <- tt_df |> filter(Comparison == "TNvsLuA") |> 
+  column_to_rownames("PTMs") |> select(-Comparison)
+```
+
+
+```{r Heatmap}
+set.seed(10)
+coldata <- colData(se)
+coldata$Relapse <-ifelse(coldata$Subtype == "LuA", NA,
+                         ifelse(coldata$Subtype == "TNnoRel", "No", "Yes"))
+column_ha <-  HeatmapAnnotation(
+                                HER2Score = coldata$`HER2 Score`,
+                                Grade = coldata$Grade,
+                                Ki67 = coldata$`Ki67 %`,
+                                ER = coldata$`ER %`,
+                                PGR = coldata$`PGR %`,
+                                Relapse = coldata$Relapse,
+                                col = list(Grade = c(G1 = "gray65",
+                                                      G2 = "gray40",
+                                                      G3 = "gray20"),
+                                            HER2Score = c(`0` = "#aab0ed",
+                                                          `1+` = "#80fbf5",
+                                                          `2+` = "#9cfbb9",
+                                                          `3+` = "#fadca8",
+                                                          Neg = "#f07e86"),
+                                            ER = circlize::colorRamp2(colors = c("white", "#3399FF"),
+                                                                      breaks = c(0,1)),
+                                            PGR = circlize::colorRamp2(colors = c("white", "#430787"),
+                                                                      breaks = c(0,1)),
+                                           Relapse = c(No = "#EFE1E1",
+                                                     Yes = "#D1B4C6")),
+                              na_col = "gray90")
+
+rowNormData <- assay(se) - rowMeans(assay(se), na.rm = T)
+h1 <- Heatmap(
+        as.matrix(rowNormData),
+        name = "log2 L/H ratio", show_column_names = F,
+        col = circlize::colorRamp2(colors = c("blue", "white", "red"),
+                                   space = "RGB",
+                                   breaks = c(-2,0,2)),
+        na_col = "gray90",
+        column_split = ifelse(coldata$Subtype == "LuA", "LuA", "TN"),
+        cluster_column_slices = FALSE,
+        clustering_method_columns = "average",
+        clustering_method_rows = "average",
+        clustering_distance_columns = "pearson",
+        clustering_distance_rows = "pearson",
+        top_annotation = column_ha,
+        row_names_gp = gpar(fontsize = 10),
+        row_names_side = "left",
+        border = T, column_gap = unit(0, "mm"))
+
+h2 <- Heatmap(TNvsLuA[rownames(rowNormData),] |> 
+                mutate(logFC = ifelse(P.Value <= 0.05, logFC, NA)) |>
+                select(logFC) |> as.matrix(),
+              name = "logFC",
+        cluster_rows = F, cluster_columns = F,
+        na_col = "white",
+        col = circlize::colorRamp2(colors = c("cadetblue2", "white", "coral3"),
+                                   space = "RGB",
+                                   breaks = c(-2,0,2)),
+        column_names_gp = gpar(fontsize = 10),
+        show_row_names = F,
+        border = T,
+        width = unit(.5, "cm"))
+
+h1+h2
+```
+
+
+```{r PCA}
+scale_var_data <- function(PCAobj, select_var=10){
+    # from https://github.com/kassambara/factoextra/blob/master/R/fviz_pca.R
+    
+    # Data frame to be used for plotting
+    var <- facto_summarize(PCAobj, element = "var", 
+                           result = c("coord", "contrib", "cos2"),
+                           axes = c(1,2)) # PC1 ad PC2
+    colnames(var)[2:3] <-  c("x", "y")
+
+    pca.ind <- get_pca_ind(PCAobj)
+    ind <- data.frame(pca.ind$coord[, c(1,2), drop=FALSE],
+                      stringsAsFactors = TRUE)
+    colnames(ind)<- c("x", "y")
+
+    # rescale variable coordinates
+    scale_factor <- min(
+        (max(ind[,"x"])-min(ind[,"x"])/(max(var[,"x"])-min(var[,"x"]))),
+        (max(ind[,"y"])-min(ind[,"y"])/(max(var[,"y"])-min(var[,"y"])))
+        ) * 0.7
+    var[, c("x", "y")] <- var[, c("x", "y")]*scale_factor
+    var <- var |> arrange(desc(contrib)) |> slice_head(n = select_var)
+    return(var)
+}
+
+df.pca <- rowNormData
+df.pca[is.na(df.pca)] <- 0
+res.pca <- PCA(t(df.pca),
+               graph = FALSE,
+               scale.unit = FALSE,
+               ncp = 2)
+
+points_data <- res.pca$ind$coord |> as_tibble() |>  
+    mutate(Subtype = if_else(coldata$Subtype == "LuA", "LuA", "TN"),
+           Relapse = if_else(coldata$Subtype == "TNRel", "Yes", "No"))
+
+ggplot(points_data, aes(x = Dim.1, y = Dim.2)) +
+  geom_point(aes(color=Subtype, shape=Relapse), size = 4) +
+  theme_classic() +
+  scale_color_manual(values = c('#80ffff', # LuA
+                                'black'))  + # TN
+  # Yes empty circle
+  scale_shape_manual(values = c(16, 1)) +
+  xlab(paste0('Component 1 (',
+              round(res.pca$eig['comp 1', 'percentage of variance'], 1),
+              '%)')) +
+  ylab(paste0('Component 2 (',
+              round(res.pca$eig['comp 2', 'percentage of variance'], 1),
+              '%)')) +
+  theme(text = element_text(family = 'Arial'),
+        legend.position="none") +
+  geom_segment(data = scale_var_data(res.pca) |> 
+                 mutate(xstart = 0, ystart = 0), 
+               aes(x = xstart, y = ystart,
+                   xend = x, yend = y),
+               arrow = grid::arrow(length = grid::unit(0.2, 'cm')),
+               color = 'black', alpha = .8, linewidth = .5) +
+  ggrepel::geom_text_repel(data = scale_var_data(res.pca),
+                           aes(x = x, y = y, label = name))
+```
+

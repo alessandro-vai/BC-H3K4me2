@@ -1,0 +1,150 @@
+---
+title: "Fig 1b"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Libraries}
+library(tidyverse) |> suppressPackageStartupMessages()
+library(SummarizedExperiment) |> suppressPackageStartupMessages()
+library(limma)
+library(ComplexHeatmap) |> suppressPackageStartupMessages()
+```
+
+```{r make SE}
+ratios <- readxl::read_xlsx("Supplementary Dataset 2.xlsx",
+                            sheet = "Cohort 1",
+                            skip = 4, col_names = F) |> 
+    column_to_rownames("...1")
+
+info <- readxl::read_xlsx("Supplementary Dataset 2.xlsx",
+                        sheet = "Cohort 1",
+                        n_max = 3, col_names = F) |> 
+    t()
+colnames(info) <- c("Sample ID", "Subtype", "Storage")
+info <- info[-1,]
+clinical <- readxl::read_xlsx("Supplementary Dataset 1.xlsx",
+                               col_types = c("guess", "guess",
+                                             "guess", "guess",
+                                             "date", "guess",
+                                             "guess", "date",
+                                             "date", rep("guess", 8))) |> 
+    filter(Cohort == "Cohort 1") |> 
+    select(-Subtype, -Storage)
+
+clinical <- left_join(as_tibble(info), clinical)
+
+se <- SummarizedExperiment(assays = ratios,
+                           colData = clinical)
+```
+
+```{r limma all vs TN}
+colData(se)$Subtype <- relevel(factor(colData(se)$Subtype), ref = "TN")
+mm0 <- model.matrix(~Subtype, data = colData(se))
+colnames(mm0) <- str_remove(colnames(mm0), "Subtype")
+mm0 <- mm0[,c("(Intercept)","Normal","LuA","LuB","HER")]
+limma.res <- lmFit(assay(se), mm0) |>
+    eBayes(robust = T)
+diz <- colnames(mm0)
+getTable <- function(coefTotest) {
+    res <- topTable(limma.res, adjust.method = "none",
+                    p.value = 0.05, n=Inf,
+                    coef = coefTotest) |> 
+      mutate(Subtype = diz[coefTotest],
+             logFC = -logFC) |> rownames_to_column("PTM") |> 
+      select(PTM, logFC, Subtype)
+    return(res)
+}
+
+for_heatmappina <- lapply(2:5, getTable) |> bind_rows() |> 
+  pivot_wider(names_from = Subtype, values_from = logFC)
+
+for (ptm in setdiff(rownames(se), for_heatmappina$PTM)) {
+  for_heatmappina <- for_heatmappina |> add_row(PTM = ptm,
+                                                Normal = NA,
+                                                LuA = NA,
+                                                LuB = NA,
+                                                HER = NA)
+}
+for_heatmappina <- for_heatmappina |> column_to_rownames("PTM") |> as.matrix()
+
+get_colorbar_without_outliers <- function(df, no_SD=2.5) {
+    vec <- as.vector(simplify2array(df))
+    outliers_upper_boundary <- mean(vec, na.rm = T) + no_SD * sd(vec, na.rm = T)
+    outliers_lower_boundary <- mean(vec, na.rm = T) - no_SD * sd(vec, na.rm = T)
+    vec <- vec[vec < outliers_upper_boundary & vec > outliers_lower_boundary]
+    colorbar <- circlize::colorRamp2(c(min(vec[! is.na(vec)]),
+                             0,
+                             max(vec[! is.na(vec)])),
+                           c("cadetblue2", "white", "#ffc299"), space = "RGB")
+    return(colorbar)
+}
+
+```
+
+```{r Heatmap}
+coldata <- colData(se)
+set.seed(10)
+coldata$Subtype <- factor(coldata$Subtype, levels = c("Normal","LuA","LuB","HER","TN"))
+column_ha <-  HeatmapAnnotation(Storage = coldata$`Storage type`,
+                                HER2Score = coldata$`HER2 Score`,
+                                Grade = coldata$Grade,
+                                Ki67 = coldata$`Ki67 %`,
+                                ER = coldata$`ER %`,
+                                PGR = coldata$`PGR %`,
+                                col = list( Storage = c(FF = '#CCEDFF',
+                                                        FFPE = '#CCEDDF',
+                                                        OCT = '#FDD2D9'),
+                                            Grade = c(G1 = "gray65",
+                                                      G2 = "gray40",
+                                                      G3 = "gray20"),
+                                            HER2Score = c(`1+` = "#80fbf5",
+                                                          `2+` = "#9cfbb9",
+                                                          `3+` = "#fadca8",
+                                                          Neg = "#f07e86"),
+                                            ER = circlize::colorRamp2(colors = c("white", "#3399FF"),
+                                                                      breaks = c(0,1)),
+                                            PGR = circlize::colorRamp2(colors = c("white", "#430787"),
+                                                                      breaks = c(0,1))),
+                              na_col = "gray90")
+
+rowNormData <- assay(se) - rowMeans(assay(se), na.rm = T)
+
+h1 <- Heatmap(
+        as.matrix(rowNormData),
+        name = "log2 L/H ratio", show_column_names = F,
+        col = circlize::colorRamp2(colors = c("blue", "white", "red"),
+                                   space = "RGB",
+                                   breaks = c(-2,0,2)),
+        na_col = "gray90",
+        column_split = coldata$Subtype,
+        cluster_column_slices = FALSE,
+        clustering_method_columns = "average",
+        clustering_method_rows = "average",
+        clustering_distance_columns = "pearson",
+        clustering_distance_rows = "pearson",
+        top_annotation = column_ha,
+        row_split = ifelse(startsWith(rownames(assay(se)), "H3"), "H3", "H4"),
+        row_names_gp = gpar(fontsize = 10),
+        row_names_side = "left",
+        cluster_row_slices = F,
+        border = T, column_gap = unit(0, "mm"))
+
+heatmappina <- Heatmap(for_heatmappina[rownames(rowNormData),], name = "logFC TN",
+        cluster_rows = F, cluster_columns = F,
+        na_col = "white",
+        col = get_colorbar_without_outliers(for_heatmappina),
+        column_names_gp = gpar(fontsize = 10),
+        show_row_names = F,
+        border = T,
+        width = unit(1.5, "cm"))
+
+h1+heatmappina
+```
+
+
