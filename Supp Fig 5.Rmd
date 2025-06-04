@@ -1,0 +1,117 @@
+---
+title: "Supp Fig 5"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(tidyverse) |> suppressPackageStartupMessages()
+library(SummarizedExperiment) |> suppressPackageStartupMessages()
+library(survminer)
+library(survival)
+```
+
+
+```{r Dataset}
+# SummarizedExperiment object as created in Fig 1b.Rmd
+set1 <- readRDS("se_cohort1.rds")
+set1$Set <- "Cohort 1"
+# SummarizedExperiment object as created in Supp Fig 3.Rmd
+set2 <- readRDS("se_cohort2.rds")
+set2$Set <- "Cohort 2"
+# Same code used in Supp Fig 3.Rmd
+oct <- readRDS("se_cohort3.rds")
+oct$Set <- "Cohort 3"
+
+set1 <- SummarizedExperiment(assays = rbind(assay(set1),
+                                            H3K4me3 = rep(NA, length(set1$Subtype))),
+                             colData = colData(set1))
+
+
+assay_merged <- inner_join(as_tibble(assay(set1), rownames = "PTM"),
+                           as_tibble(assay(set2), rownames = "PTM"), by="PTM") |> 
+    inner_join(as_tibble(assay(oct), rownames = "PTM"), by="PTM")
+coldata_merged <- bind_rows(as_tibble(as.data.frame(colData(set1)), rownames = "SampleName"),
+                           as_tibble(as.data.frame(colData(set2)), rownames = "SampleName"),
+                           as_tibble(as.data.frame(colData(oct)), rownames = "SampleName"))
+
+se <- SummarizedExperiment(assays = assay_merged |> column_to_rownames("PTM"),
+                           colData = coldata_merged |> column_to_rownames("SampleName"))
+# Remove samples with no clinical info
+se <- se[,se$`Sample ID` != "unmatched"))]
+```
+
+
+```{r Survival}
+# Either DFS or OS
+surv_type <- "DFS"
+
+surv_data <- colData(se) |> as.data.frame() |>
+  select(Date.of.surgery, Death, EVENT, Date.of.survival, Set, Date.of.Event)
+
+
+if(surv_type == "OS"){
+  surv_data <- surv_data |> 
+    mutate(duration = as.numeric(difftime(Date.of.survival,
+                                        Date.of.surgery, units = "days"))) |> 
+    rename("Death" = "Event")
+
+} else {
+  surv_data <- surv_data |>
+    mutate(end_date = coalesce(Date.of.Event, Date.of.survival),
+         duration = as.numeric(difftime(end_date, Date.of.surgery, units = "days")),
+         Event = if_else(EVENT == "yes", 1, 0))
+}
+
+surv_data <- surv_data |> 
+  filter(duration > 0) |> 
+  as_tibble(rownames = "Patient")
+
+for (ptm in assay(se) |> rownames() |> unique()){
+  ptm_col <-  sym(ptm)
+  surv_data_loop <- inner_join(surv_data,
+                          assay(se) |> t() |> as_tibble(rownames = "Patient") |> select(Patient, !!ptm_col), by = "Patient") |> 
+    mutate(Strata = if_else(!!ptm_col > median(!!ptm_col, na.rm=T), "High", "Low"), .by =Set) |> as.data.frame()
+
+  pval <- survdiff(Surv(time = duration, event = Event) ~ Strata, data = surv_data_loop)$pvalue
+  if (pval <= 0.05) {
+    # Fit a Kaplan-Meier model and plot the survival curve
+    km_fit <- survfit(Surv(time = duration, event = Event) ~ Strata, data = surv_data_loop)
+    p <- ggsurvplot(km_fit, data = surv_data_loop, xlab = "Days", ylab = "Survival Probability",
+             pval = T, title = ptm, palette = c("gray30", "gray80"))
+  }
+
+}
+```
+
+```{r Supp Fig 5C}
+ptms <- c("H3K4me2", "H3K4me3", "H3K9me2K14ac",
+          "H3K27me1K36me2", "H3K18acK23ac",
+          "H3K27me1K36me3")
+
+for (ptm in ptms) {
+  ptm_col <- sym(ptm)
+  p <- inner_join(colData(se)[, c("Ki67..", "Grade", "Set")] |> as.data.frame() |>
+             as_tibble(rownames = "Patient"),
+          assay(se) |> t() |> as_tibble(rownames = "Patient") |> select(Patient, !!ptm_col), by = "Patient") |> 
+    mutate(Strata = if_else(!!ptm_col > median(!!ptm_col, na.rm=T), "High", "Low"), .by =Set) |> 
+  filter(!is.na(Ki67..), !is.na(!!ptm_col)) |> 
+  ggplot(aes(x = Strata, y = Ki67.., fill = Strata)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values = c("gray30", "gray80")) +
+  ggsignif::geom_signif(
+    comparisons = list(c("Low", "High")),
+    map_signif_level = TRUE,
+    test = "wilcox.test"
+  ) + theme(text = element_text(family = "ArialMT", size = 14)) +
+    ylab("Ki67%") +
+    scale_y_continuous(labels = scales::percent)
+}
+```
+
+

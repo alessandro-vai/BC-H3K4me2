@@ -1,0 +1,161 @@
+---
+title: "Supp Fig 4B-C"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(tidyverse) |> suppressPackageStartupMessages()
+library(SummarizedExperiment) |> suppressPackageStartupMessages()
+library(ComplexHeatmap) |> suppressPackageStartupMessages()
+library(limma)
+```
+
+
+```{r Dataset}
+# SummarizedExperiment object as created in Fig 1b.Rmd
+set1 <- readRDS("se_cohort1.rds")
+set1$Set <- "Cohort 1"
+# SummarizedExperiment object as created in Supp Fig 3.Rmd
+set2 <- readRDS("se_cohort2.rds")
+set2$Set <- "Cohort 2"
+# Same code used in Fig 1b.Rmd or Supp Fig 3.Rmd
+oct <- readRDS("se_cohort3.rds")
+oct$Set <- "Cohort 3"
+
+assay_merged <- inner_join(as_tibble(assay(set1), rownames = "PTM"),
+                           as_tibble(assay(set2), rownames = "PTM"), by="PTM") |> 
+    inner_join(as_tibble(assay(oct), rownames = "PTM"), by="PTM")
+coldata_merged <- bind_rows(as_tibble(as.data.frame(colData(set1)), rownames = "SampleName"),
+                           as_tibble(as.data.frame(colData(set2)), rownames = "SampleName"),
+                           as_tibble(as.data.frame(colData(oct)), rownames = "SampleName"))
+
+se <- SummarizedExperiment(assays = assay_merged |> column_to_rownames("PTM"),
+                           colData = coldata_merged |> column_to_rownames("SampleName"))
+
+se <- se[!rownames(se) %in% c("H4K5K8K12K16un",
+                            "H4K5K8K12K16-4ac",
+                            "H4K20un", "H4K20me1",
+                            "H4K20me2", "H4K20me3",
+                            "H3K79un", "H3K79me1",
+                            "H3K79me2"),]
+
+se$Storage.type <- ifelse(se$Set == "Cohort 2", "FF",
+                          ifelse(se$Set == "Cohort 3", "OCT", se$Storage.type))
+```
+
+
+```{r Functions}
+computeImputedZscore <- function(sub_se){
+    imputed <- impute::impute.knn(as.matrix(assay(sub_se)))$data
+    zscore <- t(scale(t(imputed)))
+    return(zscore)
+}
+
+
+plotHeatmap <- function(sub_se){
+    zscore <- computeImputedZscore(sub_se)
+    set.seed(10)
+    coldata <- colData(sub_se)
+    column_ha <-  HeatmapAnnotation(
+                                Storage = coldata$Storage.type,
+                                HER2Score = coldata$HER2.Score,
+                                Grade = coldata$Grade,
+                                Ki67 = coldata$Ki67..,
+                                relapse = coldata$EVENT,
+                                col = list( Storage = c(FF = '#CCEDFF',
+                                                         FFPE = '#CCEDDF',
+                                                         OCT = '#FDD2D9'),
+                                            Grade = c(G1 = "gray65",
+                                                      G2 = "gray40",
+                                                      G3 = "gray20"),
+                                            HER2Score = c(`1+` = "#80fbf5",
+                                                          `2+` = "#9cfbb9",
+                                                          `3+` = "#fadca8",
+                                                          Neg = "#f07e86")),
+                              na_col = "gray90")
+
+    set.seed(7)
+    h <- Heatmap(zscore,
+        name = "z-score", show_column_names = F,
+        col = circlize::colorRamp2(colors = c("blue", "white", "red"),
+                                   space = "RGB",
+                                   breaks = c(-4,0,4)),
+        na_col = "gray90",
+        column_split = 2,
+        clustering_method_columns = "average",
+        clustering_method_rows = "average",
+        clustering_distance_columns = "pearson",
+        clustering_distance_rows = "pearson",
+        top_annotation = column_ha,
+        row_names_gp = gpar(fontsize = 10),
+        row_names_side = "left",
+        border = T, column_gap = unit(0, "mm"))
+    h <- draw(h)
+    return(h)
+}
+```
+
+
+```{r Heatmap Cohort 1}
+ht_cohort1 <- plotHeatmap(se[,se$Set == "Cohort 1"])
+```
+
+```{r Heatmap Cohort 2+3}
+ht_cohort23 <- plotHeatmap(se[,se$Set != "Cohort 1"])
+```
+
+
+```{r cluster comparison}
+
+doKmeans <- function(sub_se){
+    imputed <- impute::impute.knn(as.matrix(assay(sub_se)))$data
+    zscore <- scale(t(imputed))
+    set.seed(7)
+    km.res <- kmeans(zscore, 2)
+    return(list(km.res = km.res, zscore = zscore))
+}
+
+clusterComparison <- function(sub_se){
+    cluster <- doKmeans(sub_se)$km.res$cluster
+    coldata <- colData(sub_se)
+    coldata$cluster <- cluster[match(rownames(coldata), names(cluster))]
+    coldata$cluster <- paste0("cluster", coldata$cluster) |> as.factor()
+    mm <- model.matrix(~cluster, data = coldata)
+    lmFit(assay(sub_se), mm) |> 
+     eBayes(robust = F) |> 
+        topTable(adjust.method = "none",
+                 p.value = 0.05, n=Inf,
+                 coef = 2, sort.by = "none") |>
+        rownames_to_column("PTM") |> 
+       select(PTM, P.Value, logFC)
+
+    
+}
+ptm_cohort1 <- clusterComparison(se[,se$Set == "Cohort 1"]) 
+ptm_cohort23 <- clusterComparison(se[,se$Set != "Cohort 1"])
+```
+
+```{r Bubbleplot}
+# For Cohort 23 samples, km cluster showed in the heatmap and with kmeans function are swapped
+bind_rows(ptm_cohort1 |> mutate(Cohort = "First"),
+          ptm_cohort23 |> mutate(Cohort = "Second and third",
+                            logFC = -logFC)) |> 
+    mutate(Order = case_when(startsWith(PTM, "H3K4") ~ 1,
+                             startsWith(PTM, "H3K9") ~ 2,
+                             startsWith(PTM, "H3K18") ~ 3,
+                             TRUE ~ 4)) |> 
+    arrange(Order) |> 
+    mutate(PTM = PTM |> as_factor() |> fct_inorder() |> fct_rev()) |> 
+    ggplot(aes(x = Cohort, y = PTM, size = -log10(P.Value), color = logFC)) +
+    geom_point() + theme_classic() +
+    theme(text = element_text(family = "Arial", size = 14)) +
+    scale_color_gradient2(low = "blue", high = "red")
+```
+
+
+

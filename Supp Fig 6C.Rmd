@@ -1,0 +1,143 @@
+---
+title: "Supp Fig 6C"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(tidyverse) |> suppressPackageStartupMessages()
+```
+
+
+```{r signal-to-noise ratio in-house proteome}
+tot_extr <- read.table("proteinGroups.txt",header=T,sep="\t",stringsAsFactors = F,
+                        comment.char = "",quote ="")
+# remove decoy matches and matches to contaminant
+tot_extr <- tot_extr[!tot_extr$Reverse=="+",]
+tot_extr <- tot_extr[!tot_extr$Potential.contaminant=="+",]
+tot_extr <- tot_extr[!tot_extr$Only.identified.by.site=="+",]
+
+# Extract columns of LFQ intensites
+df.LFQ <- tot_extr[,grep("LFQ", colnames(tot_extr))]
+df.LFQ[df.LFQ==0] <- NA
+rownames(df.LFQ) <- tot_extr$Majority.protein.IDs
+
+# Filter protein table. DEqMS require minimum two values for each group.
+df.LFQ$na_count_LuA <- apply(df.LFQ,1,function(x) sum(is.na(x[grep("LuA",colnames(df.LFQ))])))
+df.LFQ$na_count_TN <- apply(df.LFQ,1,function(x) sum(is.na(x[grep("TN",colnames(df.LFQ))])))
+# missing
+df.LFQ.filter <- df.LFQ[df.LFQ$na_count_LuA < 2 & df.LFQ$na_count_TN < 3,1:15] #no.samples
+
+df.LFQ.filter |> log2() |> tidyr::as_tibble(rownames="Uniprot") |> 
+    tidyr::pivot_longer(!Uniprot, names_to = "Sample", values_to = "LFQ") |> 
+    dplyr::mutate(Subtype = ifelse(grepl("TN", Sample), "TN", "LuA")) |> 
+    dplyr::summarise(Mean = mean(LFQ, na.rm=T), SD= sd(LFQ, na.rm=T), .by = c(Uniprot, Subtype)) |> 
+    tidyr::pivot_wider(id_cols = Uniprot, names_from = Subtype, values_from = c(Mean, SD)) |> 
+    dplyr::mutate(SNR = (Mean_TN - Mean_LuA) / (SD_TN + SD_LuA)) |> 
+    dplyr::inner_join(tot_extr |> dplyr::select(Majority.protein.IDs, Gene.names),
+                      by = c("Uniprot" = "Majority.protein.IDs")) |> 
+    dplyr::select(Uniprot, Gene.names, SNR) |> 
+    dplyr::filter(Gene.names != "") |> 
+    dplyr::mutate(Gene.names = vapply(Gene.names, stringr::str_split_i, ";", 1, FUN.VALUE="gene")) |> 
+    dplyr::arrange(-SNR) |> 
+    readr::write_delim("SNR_proteome.txt", delim = "\t")
+```
+
+
+```{r signal-to-noise ratio in-house RNA-seq}
+count_table <- read.delim("count_table.txt")
+library(edgeR)
+group <- ifelse(grepl("LU", colnames(count_table)), "LuA", "TN")
+DEgene <- DGEList(count_table, group = group)
+# filter 0 counts
+keep.exprs <- filterByExpr(DEgene, group = group)
+DEgene <- DEgene[keep.exprs,, keep.lib.sizes=FALSE]
+#Normalization
+DEgene <- calcNormFactors(DEgene, method = "TMM")
+CPM <- cpm(DEgene)
+
+log2(CPM+1) |>
+  tidyr::as_tibble(rownames="Gene") |> 
+  tidyr::pivot_longer(!Gene, names_to = "Sample", values_to = "CPM") |> 
+  dplyr::mutate(Subtype = ifelse(grepl("TN", Sample), "TN", "LuA")) |> 
+  dplyr::summarise(Mean = mean(CPM, na.rm=T), SD= sd(CPM, na.rm=T), .by = c(Gene, Subtype)) |> 
+  tidyr::pivot_wider(id_cols = Gene, names_from = Subtype, values_from = c(Mean, SD)) |> 
+  dplyr::mutate(SNR = (Mean_TN - Mean_LuA) / (SD_TN + SD_LuA)) |> 
+  dplyr::select(Gene, SNR) |> 
+  readr::write_delim("SNR_RNAseq.txt", delim = "\t")
+```
+
+
+
+```{r Map genes to term}
+# Perseus
+mainAnnot <- read_delim("mainAnnot.homo_sapiens.txt.gz", show_col_types = F,
+                        col_select = c("Gene name", "GSEA")) |> slice(-1) |> 
+    separate_longer_delim(GSEA, delim = ";") |> 
+    summarise(Genes = paste0(`Gene name`, collapse = ";"), .by = GSEA)
+# Exported from perseus
+twoDresults <- read_delim("2D_SNR_ourdata_005.txt", show_col_types = F) |>
+    slice(-1) |>
+    mutate(`Benj. Hoch. FDR` = as.numeric(`Benj. Hoch. FDR`))
+
+joined <- inner_join(twoDresults, mainAnnot, by = c("Names" = "GSEA"))
+rm(mainAnnot, twoDresults)
+
+all_genes_detected <- union(read_delim("SNR_proteome.txt", show_col_types = F)$Gene.names,
+                            read_delim("SNR_RNAseq.txt", show_col_types = F)$Gene)
+filter_for_only_genes_detected <- function(concatString){
+    splitString <- str_split_1(concatString, ";")
+    return(intersect(splitString, all_genes_detected) |> unique() |> paste0(collapse = ";"))
+}
+joined <- joined |> mutate(Genes = vapply(Genes, filter_for_only_genes_detected, FUN.VALUE="char", USE.NAMES=F))
+```
+
+
+```{r Filtering}
+LuA_only_prom <- read.table("LuA_only_prom_genes.txt")$V1
+LuA_only_enh <- read.table("LuA_Enhancer.txt")$V1
+TN_only_prom <- read.table("TN_only_prom_genes.txt")$V1
+TN_only_enh <- read.table("TN_only_Enhancer.txt")$V1
+K4_only <- unique(c(LuA_only_prom, LuA_only_enh, TN_only_prom, TN_only_enh))
+
+hlp <- function(concatString, geneList) {
+    splitString <- str_split_1(concatString, ";")
+    len1 <- length(splitString)
+    len2 <- length(intersect(splitString, geneList))
+    ifelse(len2 / len1 >= 0.15, TRUE, FALSE)
+}
+
+filtered <- joined |> filter(vapply(Genes, hlp, K4_only, FUN.VALUE=T, USE.NAMES = F))
+```
+
+```{r Scatterplot}
+filtered |> 
+    rename("log2FoldChange" = "SNR.RNA",
+           "logFC" = "SNR.PROT") |> 
+    mutate(log2FoldChange = as.numeric(log2FoldChange),
+                   logFC = as.numeric(logFC),
+                   Legend = case_when(log2FoldChange > 0 & logFC > 0 ~ "CONCORDANT UP",
+                                      log2FoldChange > 0 & logFC < 0 ~ "PROT. DOWN TRANSCR. UP",
+                                      log2FoldChange < 0 & logFC > 0 ~ "PROT. UP TRANSCR. DOWN",
+                                      TRUE ~ "CONCORDANT DOWN")) |> 
+    ggplot(aes(x = log2FoldChange, y = logFC, color=Legend)) +
+    geom_point() +
+           # Use custom colors
+           scale_color_manual(
+           values = c("#80ffff", "black", "cadetblue1", "chocolate1")
+            ) + 
+           ggrepel::geom_text_repel(
+           aes(label = Names),
+           size = 3.5,
+          max.overlaps = 17
+          ) + theme_classic() + geom_hline(yintercept=0, linetype="dashed", color = "gray80") +
+             geom_vline(xintercept=0, linetype="dashed", color = "gray80") +
+    ylab("Proteome score") +
+    xlab("Transcriptome score") +
+    xlim(-1,1) + ylim(-1,1)
+```
+

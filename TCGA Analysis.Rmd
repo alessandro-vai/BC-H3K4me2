@@ -1,0 +1,132 @@
+---
+title: "TCGA Analysis"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(tidyverse) |> suppressPackageStartupMessages()
+library(SummarizedExperiment) |> suppressPackageStartupMessages()
+library(DESeq2) |> suppressPackageStartupMessages()
+```
+
+```{r Make BRCA SummarizedExperiment}
+# First, import the GTF-file that you have also used as input for htseq-count
+gencode22 <- rtracklayer::import.gff3("gencode.v22.annotation.gff3.gz")
+gencode22$gene_id <- str_remove(gencode22$gene_id, "\\.\\d+")
+cts <- read_delim("htseq_counts.txt", show_col_types = F,
+                  num_threads = 4) |> column_to_rownames("ENSGENE") |> 
+    as.matrix()
+gencode22 <- gencode22[gencode22$gene_id %in% rownames(cts),]
+gencode22 <- gencode22[gencode22$type == "gene",]
+# Discard pseudoautosomal regions
+gencode22 <- gencode22[!duplicated(gencode22$gene_id),]
+gencode22 <- gencode22[match(rownames(cts), gencode22$gene_id),]
+gencode22 <- gencode22[, colnames(mcols(gencode22)) %in% c("source",
+                                                           "type",
+                                                           "gene_id",
+                                                           "gene_type",
+                                                           "gene_status",
+                                                           "gene_name",
+                                                           "havana_gene")]
+coldata <- read.delim("batches.tsv")
+luma <- read.table("lumA_NON_TNBC_TCGA.txt")$V1
+tn <- read.table("TNBC_samples_TCGA.txt")$V1
+coldata <- coldata |> mutate(patient_id = vapply(Sample,
+                                                 \(x) str_split_1(x, "\\-")[1:3] |>
+                                                     paste0(collapse = "-"),
+                                                 FUN.VALUE = c("id")),
+                             Subtype = case_when(patient_id %in% luma ~ "LumA",
+                                                 patient_id %in% tn ~ "TN",
+                                                 TRUE ~ "REMOVE")) |> 
+    filter(Subtype != "REMOVE", sample_type_name=="Primary Tumor") |>
+    # Some patients have more samples
+    # Explanation here: https://groups.google.com/g/cbioportal/c/znSTrWH5mqg
+    distinct(patient_id, .keep_all = T) |> 
+    column_to_rownames("Sample")
+tmp <- intersect(colnames(cts),rownames(coldata))
+cts <- cts[,colnames(cts)  %in% tmp]
+coldata <- coldata[rownames(coldata) %in% tmp,]
+coldata <- coldata[match(colnames(cts), rownames(coldata)),]
+brca_se <- SummarizedExperiment(assays=list(counts=cts),
+                     rowRanges=gencode22, colData=coldata)
+```
+
+
+```{r Filter by biotype}
+biotypes_to_remove <- c("3prime_overlapping_ncrna",
+                        "snRNA","miRNA","misc_RNA",
+                        "snoRNA","rRNA","ribozyme",
+                        "scaRNA", "vaultRNA", "sRNA")
+brca_se <- brca_se[!rowData(brca_se)$gene_type %in% biotypes_to_remove,]
+saveRDS(brca_se, "BRCA_SE_filtered.rds")
+```
+
+```{r Combat Batch Corection}
+brca_se$Batch <-  paste(brca_se$batch_id,
+                        brca_se$ship_date,
+                        brca_se$tissue_source_site,
+                        sep = "_")
+one_sample_per_batch <- fct_count(brca_se$Batch) |> filter(n == 1)
+brca_se <- brca_se[, ! brca_se$Batch %in% one_sample_per_batch$f]
+brca_se$Batch <- factor(brca_se$Batch)
+adj_counts <- sva::ComBat_seq(
+    counts = assay(brca_se),
+    batch = brca_se$Batch,
+    group = brca_se$Subtype
+)
+
+batch_dds <- DESeqDataSetFromMatrix(adj_counts,
+                               colData=colData(brca_se),
+                               ~Subtype)
+smallestGroupSize <- brca_se$Subtype |> table() |> min()
+keep <- rowSums(counts(batch_dds) >= 10) >= smallestGroupSize
+batch_dds <- batch_dds[keep,]
+rm(keep, smallestGroupSize)
+batch_dds <- DESeq(batch_dds, parallel = T,
+                   BPPARAM = BiocParallel::MulticoreParam(4))
+saveRDS(batch_dds, "combat_dds.rds")
+
+res_batch <- results(batch_dds,
+               contrast=c("Subtype","TN","LumA"),
+               alpha = 0.05)
+DEG_table <- res_batch |> as.data.frame() |>
+  merge(rowData(brca_se)[, c("gene_id", "gene_name")], by=0) |> 
+  as.data.frame() |> 
+  select(-Row.names)
+
+vsd <- vst(batch_dds, blind=FALSE)
+zscore <- t(scale(t(assay(vsd))))
+inner_join(as_tibble(zscore, rownames="gene_id"),
+            DEG_table[, c("gene_id", "gene_name")], by = "gene_id") |> 
+   select(-gene_id) |> distinct(gene_name, .keep_all = T) |> 
+   column_to_rownames("gene_name") |> 
+   saveRDS("Zscore_combat.rds")
+```
+
+
+```{r TPM}
+txdb <- txdbmaker::makeTxDbFromGFF("gencode.v22.annotation.gff3.gz")
+exons <- GenomicFeatures::exonsBy(txdb, by = "gene")
+names(exons) <- str_remove(names(exons), "\\.\\d+")
+exons <- exons[match(names(rowRanges(batch_dds)), names(exons))]
+rowRanges(batch_dds) <- exons
+FPKM <- fpkm(batch_dds, robust = TRUE)
+tpm <- t( t(FPKM) / colSums(FPKM) ) * 1e6
+rm(txdb, exons, FPKM)
+
+tpm_combat <- merge(tpm, rowData(brca_se)[, c("gene_id", "gene_name")], by=0) |> 
+    dplyr::select(-gene_id, -Row.names)
+TN_patients <- colData(batch_dds) |> as.data.frame() |> filter(Subtype == "TN") |> rownames()
+tpm_combat$TN <- rowMeans(tpm_combat[,colnames(tpm_combat) %in% TN_patients])
+tpm_combat$LuA <- rowMeans(tpm_combat[,!colnames(tpm_combat) %in% TN_patients])
+tpm_combat <- tpm_combat[, c("TN", "LuA")]
+tpm_combat |> as_tibble(rownames="Gene") |>
+  pivot_longer(!Gene, names_to = "Subtype", values_to = "TPM") |> 
+  saveRDS("TPM_combat.rds")
+```
+

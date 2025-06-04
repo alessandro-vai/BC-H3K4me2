@@ -1,0 +1,68 @@
+---
+title: "Fig 4e"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse) |> suppressPackageStartupMessages()
+```
+
+```{r}
+# From 'TCGA Analysis.Rmd'
+tpm <- readRDS("TPM_combat.rds")
+tpm <- tpm |> 
+    mutate(TPM = log2(TPM+1))
+TN_only_prom <- read.table("TN_only_prom_genes.txt")$V1
+LuA_only_prom <- read.table("LuA_only_prom_genes.txt")$V1
+common_prom <- read.table("common_prom_genes.txt")$V1
+TN_only_enh <- read.table("TN_only_Enhancer.txt")$V1
+LuA_only_enh <- read.table("LuA_only_ATAC_Enhancer.txt")$V1
+common_enh <- read.table("common_Enhancer.txt")$V1
+
+
+tpm_prom <- tpm |> mutate(Legend = case_when(Gene %in% TN_only_prom ~ "TN only",
+                                             Gene %in% LuA_only_prom ~ "LuA only",
+                                             Gene %in% common_prom ~ "Common",
+                                             TRUE ~ "remove")) |> 
+    filter(Legend != "remove")
+tpm_enh <- tpm |> mutate(Legend = case_when(Gene %in% TN_only_enh ~ "TN only",
+                                             Gene %in% LuA_only_enh ~ "LuA only",
+                                             Gene %in% common_enh ~ "Common",
+                                             TRUE ~ "remove")) |> 
+    filter(Legend != "remove")
+```
+
+```{r Boxplot}
+print_boxplot <- function(data, Class, feature) {
+    data <- data |> filter(Legend == Class, Feature == feature)
+    p <- ggplot(data, aes(x=Subtype, y=TPM, fill=Subtype)) +
+    geom_boxplot(notch = T, outliers = F) +
+    theme_classic() +
+    scale_fill_manual(values = c("#80ffff", "black")) +
+    ggsignif::geom_signif(comparisons = list(c("LuA", "TN")),
+                          test = "wilcox.test",
+                          y_position = 11,
+                          map_signif_level = TRUE) +
+    ylim(0, 12) +
+    theme(text = element_text(size = 14, family = 'ArialMT'),
+          plot.title = element_text(size = 14, family = 'ArialMT')) +
+    ylab(bquote(~log[2] ~ "(TPM + 1)"))
+    return(p)
+}
+
+plotdata <- bind_rows(tpm_prom |> mutate(Feature = "Promoter"),
+                      tpm_enh |> mutate(Feature = "Enh"))
+
+for (Class in c("TN only", "LuA only", "Common")) {
+    for (feature in c("Promoter", "Enh")) {
+        print_boxplot(plotdata, Class, feature)
+    }
+}
+```
+
+

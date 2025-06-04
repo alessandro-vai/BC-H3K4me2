@@ -1,0 +1,70 @@
+---
+title: "Fig 4c"
+author: "Alessandro Vai"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(tidyverse) |> suppressPackageStartupMessages()
+```
+
+```{r tsv}
+# Command to obtain tsv file e.g using common regions:
+# computeMatrix scale-regions -S *.bw -R common.bed -a 1000 -b 1000 \
+#  -o tmp.gz --skipZeros --smartLabels --outFileNameMatrix Common.tsv
+
+tsv <- read_delim("Common.tsv", show_col_types = F, num_threads = 4,
+                  comment = "#")
+colNames <- colnames(tsv)[2:length(colnames(tsv))]
+tsv <- tsv |> select(-last_col())
+colnames(tsv) <- colNames
+rm(colNames)
+```
+
+```{r Common}
+tmp <- colMeans(tsv) |> as_tibble(rownames="Subtype") |> 
+    mutate(Bin = rep(1:300, ncol(tsv) / 300),
+           Subtype = if_else(str_detect(Subtype, "LuA"), "LuA", "TN")) |> 
+    summarise(mean_bin = mean(value), sd_bin = sd(value), .by = c(Bin, Subtype))
+
+tmp |> ggplot(aes(x = Bin, y = mean_bin, group = Subtype, color = Subtype)) +
+    geom_line() +
+    geom_ribbon(aes(ymin=mean_bin - sd_bin, ymax=mean_bin + sd_bin, fill = Subtype), alpha = 0.3, color = NA) +
+    theme_classic() +
+    scale_x_continuous(breaks = c(0, 100, 200, 300),
+                       labels = c("-1kb", "Peak\nstart", "Peak\nend", "+1kb")) +
+    xlab("") + ylab("RPGC") +
+    scale_fill_manual(values = c("#80ffff", "black")) +
+    scale_color_manual(values = c("#80ffff", "black")) +
+    theme(text = element_text(family = "ArialMT", size = 14))
+```
+
+```{r LuA/TN only}
+tmp <- colMeans(tsv) |> as_tibble(rownames="Subtype") |> 
+    mutate(Bin = rep(1:300, ncol(tsv) / 300),
+           Subtype = if_else(str_detect(Subtype, "LuA"), "LuA", "TN"))
+
+ggplot(tmp, aes(x = Bin, y = value, color=Subtype, fill=Subtype)) +
+  stat_summary(
+    geom = "smooth",
+    fun.data = mean_cl_normal,
+    fun.args = list(conf.int = 0.95),
+    alpha = .3,
+    se = TRUE) +
+    theme_classic() +
+    scale_x_continuous(breaks = c(0, 100, 200, 300),
+                       labels = c("-1kb", "Peak\nstart", "Peak\nend", "+1kb")) +
+    xlab("") + ylab("RPGC") +
+    scale_fill_manual(values = c("#80ffff", "black")) +
+    scale_color_manual(values = c("#80ffff", "black")) +
+    theme(text = element_text(family = "ArialMT", size = 14)) +
+    ylim(0.05,1)
+```
+
+
+
+
